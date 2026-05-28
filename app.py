@@ -9,7 +9,7 @@ from models.engine import RecommendationEngine
 app = Flask(__name__)
 CORS(app)
 
-print("Loading recommendation engine...")
+print("Loading BrandHive recommendation engine...")
 engine = RecommendationEngine()
 engine.load()
 print("Engine ready!")
@@ -24,7 +24,22 @@ app.register_blueprint(insights_bp,   url_prefix="/api")
 
 @app.route("/")
 def health():
-    return {"status": "ok", "message": "Recommendation API is running!"}
+    return {
+        "status": "ok",
+        "message": "BrandHive Recommendation API is running!",
+        "endpoints": {
+            "POST /api/recommend":                "Category-based recommendations",
+            "GET  /api/trending":                 "Trending products (optional ?category=)",
+            "GET  /api/similar/<product_id>":     "Similar products by MongoDB ID",
+            "POST /api/behavioral/recommend":     "Personalized recommendations from interactions",
+            "POST /api/behavioral/track":         "Track user event",
+            "GET  /api/categories":               "All categories",
+            "GET  /api/brands":                   "All brands (optional ?category=)",
+            "GET  /api/insights/kpis":            "Platform KPIs",
+            "GET  /api/insights/products":        "Product statistics",
+            "GET  /api/insights/trending":        "Trending insights",
+        }
+    }
 
 
 import os
