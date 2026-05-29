@@ -1,7 +1,16 @@
 from flask import Blueprint, request, jsonify, current_app
+import math
 
 recommend_bp = Blueprint("recommend", __name__)
 
+def sanitize(obj):
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    if isinstance(obj, dict):
+        return {k: sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [sanitize(i) for i in obj]
+    return obj
 
 @recommend_bp.route("/recommend", methods=["POST"])
 def recommend():
@@ -10,7 +19,6 @@ def recommend():
     categories = body.get("categories", [])
     if not categories:
         return jsonify({"error": "categories is required"}), 400
-
     results = engine.recommend_by_preferences(
         categories   = categories,
         min_price    = float(body.get("min_price", 0)),
@@ -20,8 +28,7 @@ def recommend():
         on_sale_only = bool(body.get("on_sale_only", False)),
         top_n        = int(body.get("top_n", 12)),
     )
-    return jsonify({"products": results, "count": len(results)})
-
+    return jsonify(sanitize({"products": results, "count": len(results)}))
 
 @recommend_bp.route("/trending", methods=["GET"])
 def trending():
@@ -29,21 +36,16 @@ def trending():
     category = request.args.get("category")
     top_n    = int(request.args.get("top_n", 12))
     results  = engine.get_trending(category=category, top_n=top_n)
-    return jsonify({"products": results, "count": len(results)})
-
+    return jsonify(sanitize({"products": results, "count": len(results)}))
 
 @recommend_bp.route("/categories", methods=["GET"])
 def get_categories():
     engine = current_app.config["ENGINE"]
     return jsonify({"categories": engine.get_categories()})
 
-
 @recommend_bp.route("/brands", methods=["GET"])
 def get_brands():
     engine   = current_app.config["ENGINE"]
     category = request.args.get("category")
-    if category:
-        brands = engine.get_brands_by_category(category)
-    else:
-        brands = engine.get_brands()
+    brands   = engine.get_brands_by_category(category) if category else engine.get_brands()
     return jsonify({"brands": brands})
