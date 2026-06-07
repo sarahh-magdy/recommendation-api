@@ -1,146 +1,163 @@
 import os
-import ast
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
 
+# ─── Constants ────────────────────────────────────────────────────────────────
+COLD_START_SCORE = 0.1
+FEAT_W           = 0.6
+TFIDF_W          = 0.4
+CAT_BOOST        = 1.3
+TOP_K_SIMILAR    = 50
+
+FEATURES = [
+    "category_name_enc",
+    "brand_name_enc",
+    "price_norm",
+    "rating_norm",
+    "engagement_score",
+    "has_discount",
+]
+WEIGHTS = [5, 2, 2, 3, 2, 1]
+
+EVENTS = {"view": 1, "addtocart": 3, "transaction": 5}
+
+COMPLEMENTARY = {
+    "fashion":      ["accessories", "beauty"],
+    "accessories":  ["fashion", "beauty"],
+    "beauty":       ["accessories", "fashion"],
+    "home decor":   ["handicrafts"],
+    "handicrafts":  ["home decor", "accessories"],
+}
+
 
 class RecommendationEngine:
 
     def __init__(self):
-        self.df = None
-        self.X = None
-        self.pid = None           # product IDs (strings)
-        self.pop_norm = None
-        self.tfidf_matrix = None
+        self.df               = None
+        self.feature_matrix   = None
+        self.product_ids      = None
+        self.similarity_cache = {}        # lazy: idx → (top_k_idx, top_k_scores)
+        self.tfidf_matrix     = None
         self.tfidf_vectorizer = None
-        self.encoders = {}
-        self.scaler = None
-        self.is_ready = False
+        self.encoders         = {}
+        self.scaler           = None
+        self.is_ready         = False
 
-    # ─── Load & Build ─────────────────────────────────────────────────
+    # ─── Load & Build ─────────────────────────────────────────────────────────
     def load(self):
         self._load_data()
         self._preprocess()
         self._build_feature_matrix()
         self._build_tfidf()
-        self._build_popularity()
         self.is_ready = True
+        print("   Similarity cache: lazy (computed on first /similar request per product)")
 
     def _load_data(self):
         csv_path = os.getenv("PRODUCTS_CSV", "data/brandhive_products.csv")
         self.df = pd.read_csv(csv_path)
-        print(f"   Products : {len(self.df):,} rows")
+        print(f"   Products  : {len(self.df):,} rows")
         print(f"   Categories: {self.df['category_name'].unique().tolist()}")
 
     def _preprocess(self):
         df = self.df.copy()
 
-        # نظّف الأسعار
-        df["price"] = pd.to_numeric(df["price"], errors="coerce").fillna(0)
-        df["discountPrice"] = pd.to_numeric(df["discountPrice"], errors="coerce")
-        df["finalPrice"] = pd.to_numeric(df["finalPrice"], errors="coerce").fillna(df["price"])
+        df["price"]         = pd.to_numeric(df["price"],         errors="coerce").fillna(0)
+        df["discountPrice"] = pd.to_numeric(df["discountPrice"], errors="coerce").fillna(0)
+        df["finalPrice"]    = pd.to_numeric(df["finalPrice"],    errors="coerce").fillna(0)
 
-        # نظّف الـ engagement
-        df["viewCount"] = pd.to_numeric(df["viewCount"], errors="coerce").fillna(0)
-        df["cartCount"] = pd.to_numeric(df["cartCount"], errors="coerce").fillna(0)
-        df["wishlistCount"] = pd.to_numeric(df["wishlistCount"], errors="coerce").fillna(0)
+        df["viewCount"]           = pd.to_numeric(df["viewCount"],           errors="coerce").fillna(0)
+        df["cartCount"]           = pd.to_numeric(df["cartCount"],           errors="coerce").fillna(0)
+        df["wishlistCount"]       = pd.to_numeric(df["wishlistCount"],       errors="coerce").fillna(0)
         df["stats_averageRating"] = pd.to_numeric(df["stats_averageRating"], errors="coerce").fillna(0)
-        df["stats_totalReviews"] = pd.to_numeric(df["stats_totalReviews"], errors="coerce").fillna(0)
+        df["stats_totalReviews"]  = pd.to_numeric(df["stats_totalReviews"],  errors="coerce").fillna(0)
 
-        # isOnSale
-        df["isOnSale"] = df["isOnSale"].astype(str).str.lower().isin(["true", "1"])
-        df["isActive"] = df["isActive"].astype(str).str.lower().isin(["true", "1"])
+        df["isOnSale"] = df["isOnSale"].astype(str).str.lower().isin(["true", "1", "yes"])
+        df["isActive"] = df["isActive"].astype(str).str.lower().isin(["true", "1", "yes"])
 
-        # فلتر المنتجات الفعّالة فقط
-        df = df[df["isActive"] == True].copy()
+        df = df[df["isActive"]].copy()
 
-        # Encode الـ categories والـ brands
+        df["category_name"] = df["category_name"].astype(str).str.lower().str.strip()
+        df["brand_name"]    = df["brand_name"].astype(str).str.lower().str.strip()
+
         for col in ["category_name", "brand_name"]:
             le = LabelEncoder()
-            df[col + "_enc"] = le.fit_transform(df[col].astype(str))
+            df[col + "_enc"] = le.fit_transform(df[col])
             self.encoders[col] = le
 
-        # Normalize الأسعار والـ rating
         self.scaler = MinMaxScaler()
         df[["price_norm", "rating_norm"]] = self.scaler.fit_transform(
             df[["finalPrice", "stats_averageRating"]]
         )
 
-        # Popularity score من engagement
-        max_view = df["viewCount"].max() + 1e-9
-        max_cart = df["cartCount"].max() + 1e-9
+        max_view = df["viewCount"].max()     + 1e-9
+        max_cart = df["cartCount"].max()     + 1e-9
         max_wish = df["wishlistCount"].max() + 1e-9
         df["engagement_score"] = (
-            df["viewCount"] / max_view * 0.3 +
-            df["cartCount"] / max_cart * 0.5 +
+            df["viewCount"]     / max_view * 0.3 +
+            df["cartCount"]     / max_cart * 0.5 +
             df["wishlistCount"] / max_wish * 0.2
         )
+        df.loc[df["viewCount"] == 0, "engagement_score"] = COLD_START_SCORE
 
-        # discount flag
         df["has_discount"] = df["isOnSale"].astype(float)
 
         self.df = df.reset_index(drop=True)
         print(f"   After filter: {len(self.df):,} active products")
 
     def _build_feature_matrix(self):
-        FEATURES = ["category_name_enc", "brand_name_enc", "price_norm", "rating_norm", "engagement_score", "has_discount"]
-        WEIGHTS  = [5, 2, 2, 3, 2, 1]
-
         available = [f for f in FEATURES if f in self.df.columns]
         weights   = [WEIGHTS[FEATURES.index(f)] for f in available]
-
-        self.X   = self.df[available].fillna(0).values * np.array(weights)
-        self.pid = self.df["id"].values
-        print(f"   Feature matrix: {self.X.shape}")
+        self.feature_matrix = self.df[available].fillna(0).values * np.array(weights)
+        self.product_ids    = self.df["id"].astype(str).values
+        print(f"   Feature matrix : {self.feature_matrix.shape}")
 
     def _build_tfidf(self):
-        # نبني soup من الاسم + category + tags
-        def parse_tags(t):
-            try:
-                return " ".join(ast.literal_eval(t))
-            except Exception:
-                return str(t)
-
-        self.df["soup"] = (
-            self.df["name"].astype(str) + " " +
-            self.df["category_name"].astype(str) + " " +
-            self.df["brand_name"].astype(str) + " " +
-            self.df["tags"].apply(parse_tags)
+        self.df["tags_clean"] = (
+            self.df["tags"].astype(str)
+            .str.replace("[", "", regex=False)
+            .str.replace("]", "", regex=False)
+            .str.replace("'", "", regex=False)
+            .str.replace(",", " ", regex=False)
         )
-        self.tfidf_vectorizer = TfidfVectorizer(stop_words="english", max_features=5000)
-        self.tfidf_matrix = self.tfidf_vectorizer.fit_transform(self.df["soup"].fillna(""))
-        print(f"   TF-IDF matrix : {self.tfidf_matrix.shape}")
+        self.df["soup"] = (
+            self.df["name"].astype(str)          + " " +
+            self.df["category_name"].astype(str) + " " +
+            self.df["brand_name"].astype(str)    + " " +
+            self.df["tags_clean"]
+        )
+        self.tfidf_vectorizer = TfidfVectorizer(
+            token_pattern=r"(?u)\b\w+\b", max_features=5000
+        )
+        self.tfidf_matrix = self.tfidf_vectorizer.fit_transform(
+            self.df["soup"].fillna("")
+        )
+        print(f"   TF-IDF matrix  : {self.tfidf_matrix.shape}")
 
-    def _build_popularity(self):
-        self.pop_norm = self.df["engagement_score"].values
-        print(f"   Popularity built from viewCount/cartCount/wishlistCount")
-
-    # ─── 1. Recommend by Preferences (Category-based) ─────────────────
+    # ─── 1. Recommend by Preferences ──────────────────────────────────────────
     def recommend_by_preferences(self, categories, min_price=0, max_price=999999,
                                   min_rating=0, brands=None, on_sale_only=False, top_n=12):
         mask = (
-            self.df["category_name"].isin(categories) &
+            self.df["category_name"].isin([c.lower().strip() for c in categories]) &
             (self.df["finalPrice"] >= min_price) &
             (self.df["finalPrice"] <= max_price) &
             (self.df["stats_averageRating"] >= min_rating)
         )
         if brands:
-            mask &= self.df["brand_name"].isin(brands)
+            mask &= self.df["brand_name"].isin([b.lower().strip() for b in brands])
         if on_sale_only:
-            mask &= self.df["isOnSale"] == True
+            mask &= self.df["isOnSale"]
 
         filtered = self.df[mask].copy()
         if filtered.empty:
             return []
 
-        # Score = rating 40% + engagement 40% + discount bonus 20%
         filtered["score"] = (
-            filtered["rating_norm"] * 0.4 +
+            filtered["rating_norm"]      * 0.4 +
             filtered["engagement_score"] * 0.4 +
-            filtered["has_discount"] * 0.2
+            filtered["has_discount"]     * 0.2
         )
 
         cols = ["id", "name", "brand_name", "category_name", "finalPrice",
@@ -148,173 +165,200 @@ class RecommendationEngine:
                 "stats_averageRating", "stats_totalReviews", "score"]
         cols = [c for c in cols if c in filtered.columns]
 
-        result = (filtered.sort_values("score", ascending=False)
-                          .drop_duplicates(subset=["name"])
-                          .head(top_n)[cols]
-                          .reset_index(drop=True))
-        return result.to_dict(orient="records")
+        return (
+            filtered.sort_values("score", ascending=False)
+                    .drop_duplicates(subset=["id"])
+                    .head(top_n)[cols]
+                    .reset_index(drop=True)
+                    .to_dict(orient="records")
+        )
 
-    # ─── 2. Find Similar Products ──────────────────────────────────────
+    # ─── 2. Find Similar Products (lazy cache) ────────────────────────────────
     def find_similar(self, product_id: str, top_n=6):
-        """
-        بيجيب منتجات مشابهة بناءً على:
-        - Cosine similarity في الـ feature space
-        - TF-IDF text similarity
-        - نفس الـ category بيتأثر أكتر
-        """
-        mask = self.pid == product_id
-        if mask.sum() == 0:
+        matches = np.where(self.product_ids == product_id)[0]
+        if len(matches) == 0:
             return None, []
 
-        idx = int(np.where(mask)[0][0])
+        idx     = int(matches[0])
         product = self.df.iloc[idx]
 
-        # Feature similarity
-        feat_scores = cosine_similarity([self.X[idx]], self.X)[0]
+        # Compute once per product, cache the top-K
+        if idx not in self.similarity_cache:
+            feat_sim  = cosine_similarity([self.feature_matrix[idx]], self.feature_matrix)[0]
+            tfidf_sim = cosine_similarity(self.tfidf_matrix[idx],     self.tfidf_matrix).flatten()
+            combined  = feat_sim * FEAT_W + tfidf_sim * TFIDF_W
+            combined[idx] = -1
 
-        # TF-IDF similarity
-        tfidf_scores = cosine_similarity(self.tfidf_matrix[idx], self.tfidf_matrix).flatten()
+            top_k = np.argpartition(combined, -TOP_K_SIMILAR)[-TOP_K_SIMILAR:]
+            top_k = top_k[np.argsort(combined[top_k])[::-1]]
+            self.similarity_cache[idx] = (top_k, combined[top_k].copy())
 
-        # Combined score (feature 60% + tfidf 40%)
-        combined = feat_scores * 0.6 + tfidf_scores * 0.4
+        top_idx, top_scores = self.similarity_cache[idx]
+        scores = top_scores.copy().astype(float)
 
-        # boost نفس الـ category
-        same_cat = self.df["category_name"] == product["category_name"]
-        combined[same_cat.values] *= 1.3
+        same_cat = self.df.iloc[top_idx]["category_name"].values == product["category_name"]
+        scores[same_cat] *= CAT_BOOST
 
-        # exclude the product itself
-        combined[idx] = -1
+        order   = scores.argsort()[::-1][:top_n]
+        top_idx = top_idx[order]
+        scores  = scores[order]
 
-        top_idx = combined.argsort()[::-1][:top_n]
         result = self.df.iloc[top_idx][[
             "id", "name", "brand_name", "category_name",
             "finalPrice", "discountPrice", "isOnSale",
             "stats_averageRating", "stats_totalReviews"
         ]].copy()
-        result["similarity_score"] = combined[top_idx].round(4)
+        result["similarity_score"] = scores.round(4)
 
         original = {
-            "id": product["id"],
-            "name": product["name"],
+            "id":       product["id"],
+            "name":     product["name"],
             "category": product["category_name"],
-            "brand": product["brand_name"],
-            "price": float(product["finalPrice"]),
-            "rating": float(product["stats_averageRating"]),
+            "brand":    product["brand_name"],
+            "price":    float(product["finalPrice"]),
+            "rating":   float(product["stats_averageRating"]),
         }
         return original, result.reset_index(drop=True).to_dict(orient="records")
 
-    # ─── 3. Behavioral Recommendations ────────────────────────────────
+    # ─── 3. Behavioral Recommendations ────────────────────────────────────────
     def behavioral_recommend(self, interactions, top_n=10):
-        """
-        بيبني user vector من تفاعلاته ويجيب أقرب منتجات ليه.
-        interactions: [{"product_id": "abc123", "event": "view|addtocart|transaction"}]
-        """
-        EVENT_WEIGHTS = {"view": 1, "addtocart": 3, "transaction": 5}
-
         if not interactions:
-            # Cold start: أحسن منتجات بالـ engagement
-            result = (self.df.nlargest(top_n, "engagement_score")
-                        [["id", "name", "brand_name", "category_name",
-                          "finalPrice", "stats_averageRating", "engagement_score"]]
-                        .reset_index(drop=True))
-            return result.to_dict(orient="records")
+            return (
+                self.df.nlargest(top_n, "engagement_score")
+                    [["id", "name", "brand_name", "category_name",
+                      "finalPrice", "stats_averageRating", "engagement_score"]]
+                    .reset_index(drop=True)
+                    .to_dict(orient="records")
+            )
 
-        user_vec = np.zeros(self.X.shape[1])
-        weights_sum = 0
-        seen_ids = set()
+        user_vec   = np.zeros(self.feature_matrix.shape[1])
+        weight_sum = 0.0
+        seen_ids   = set()
 
         for item in interactions:
-            pid_val = str(item["product_id"])  # دايماً string
-            weight = EVENT_WEIGHTS.get(item.get("event", "view"), 1)
-            seen_ids.add(pid_val)
+            pid = str(item["product_id"])
+            w   = EVENTS.get(item.get("event", "view"), 1)
+            seen_ids.add(pid)
 
-            mask = self.pid == pid_val
-            if mask.sum() > 0:
-                idx = int(np.where(mask)[0][0])
-                user_vec += self.X[idx] * weight
-                weights_sum += weight
+            matches = np.where(self.product_ids == pid)[0]
+            if len(matches) > 0:
+                idx         = int(matches[0])
+                user_vec   += self.feature_matrix[idx] * w
+                weight_sum += w
 
-        if weights_sum == 0:
-            # مفيش match في الداتا — رجّع trending
-            result = (self.df.nlargest(top_n, "engagement_score")
-                        [["id", "name", "brand_name", "category_name",
-                          "finalPrice", "stats_averageRating"]]
-                        .reset_index(drop=True))
-            return result.to_dict(orient="records")
+        if weight_sum == 0:
+            return (
+                self.df.nlargest(top_n, "engagement_score")
+                    [["id", "name", "brand_name", "category_name",
+                      "finalPrice", "stats_averageRating"]]
+                    .reset_index(drop=True)
+                    .to_dict(orient="records")
+            )
 
-        user_vec /= weights_sum
-        scores = cosine_similarity([user_vec], self.X)[0]
+        user_vec /= weight_sum
+        scores    = cosine_similarity([user_vec], self.feature_matrix)[0]
 
-        # exclude المنتجات اللي اتفاعل معاها
-        for pid_val in seen_ids:
-            mask = self.pid == pid_val
-            if mask.sum() > 0:
-                scores[int(np.where(mask)[0][0])] = -1
+        for pid in seen_ids:
+            matches = np.where(self.product_ids == pid)[0]
+            if len(matches) > 0:
+                scores[int(matches[0])] = -1
 
         top_idx = scores.argsort()[::-1][:top_n]
-        result = self.df.iloc[top_idx][[
+        result  = self.df.iloc[top_idx][[
             "id", "name", "brand_name", "category_name",
             "finalPrice", "discountPrice", "isOnSale",
             "stats_averageRating", "stats_totalReviews"
         ]].copy()
         result["match_score"] = scores[top_idx].round(4)
-
         return result.reset_index(drop=True).to_dict(orient="records")
 
-    # ─── 4. Trending Products ──────────────────────────────────────────
-    def get_trending(self, category=None, top_n=12):
-        df = self.df.copy()
-        if category:
-            df = df[df["category_name"] == category]
-        result = (df.nlargest(top_n, "engagement_score")
-                    [["id", "name", "brand_name", "category_name",
-                      "finalPrice", "discountPrice", "isOnSale",
-                      "stats_averageRating", "viewCount", "cartCount", "wishlistCount"]]
-                    .reset_index(drop=True))
-        return result.to_dict(orient="records")
+    # ─── 4. Cart Cross-Sell ────────────────────────────────────────────────────
+    def cart_cross_sell(self, cart_product_ids, top_n=8):
+        cart_set          = {str(p) for p in cart_product_ids}
+        target_categories = set()
 
-    # ─── 5. KPIs ──────────────────────────────────────────────────────
+        for pid in cart_set:
+            row = self.df[self.df["id"].astype(str) == pid]
+            if not row.empty:
+                cat = row.iloc[0]["category_name"]
+                target_categories.update(COMPLEMENTARY.get(cat, []))
+
+        if not target_categories:
+            return []
+
+        mask     = self.df["category_name"].isin(target_categories) & ~self.df["id"].astype(str).isin(cart_set)
+        filtered = self.df[mask].copy()
+        if filtered.empty:
+            return []
+
+        filtered["cs_score"] = (
+            filtered["engagement_score"] * 0.50 +
+            filtered["rating_norm"]       * 0.35 +
+            filtered["has_discount"]      * 0.15
+        )
+
+        cols = ["id", "name", "brand_name", "category_name",
+                "finalPrice", "discountPrice", "isOnSale",
+                "stats_averageRating", "cs_score"]
+        cols = [c for c in cols if c in filtered.columns]
+
+        return (
+            filtered.sort_values("cs_score", ascending=False)
+                    .drop_duplicates("id")
+                    .head(top_n)[cols]
+                    .reset_index(drop=True)
+                    .to_dict(orient="records")
+        )
+
+    # ─── 5. Trending Products ──────────────────────────────────────────────────
+    def get_trending(self, category=None, top_n=12):
+        df = self.df if category is None else self.df[self.df["category_name"] == category.lower().strip()]
+        return (
+            df.nlargest(top_n, "engagement_score")
+              [["id", "name", "brand_name", "category_name",
+                "finalPrice", "discountPrice", "isOnSale",
+                "stats_averageRating", "viewCount", "cartCount", "wishlistCount"]]
+              .reset_index(drop=True)
+              .to_dict(orient="records")
+        )
+
+    # ─── 6. KPIs ──────────────────────────────────────────────────────────────
     def get_kpis(self):
         df = self.df
-        total_views    = int(df["viewCount"].sum())
-        total_carts    = int(df["cartCount"].sum())
-        total_wishlists = int(df["wishlistCount"].sum())
-        on_sale        = int(df["isOnSale"].sum())
-        avg_rating     = round(float(df["stats_averageRating"].mean()), 2)
-        avg_price      = round(float(df["finalPrice"].mean()), 2)
-
+        total_views = int(df["viewCount"].sum())
+        total_carts = int(df["cartCount"].sum())
         return {
-            "total_products": len(df),
-            "total_views": total_views,
-            "total_cart_adds": total_carts,
-            "total_wishlists": total_wishlists,
-            "products_on_sale": on_sale,
-            "avg_rating": avg_rating,
-            "avg_price_egp": avg_price,
+            "total_products":      len(df),
+            "total_views":         total_views,
+            "total_cart_adds":     total_carts,
+            "total_wishlists":     int(df["wishlistCount"].sum()),
+            "products_on_sale":    int(df["isOnSale"].sum()),
+            "avg_rating":          round(float(df["stats_averageRating"].mean()), 2),
+            "avg_price_egp":       round(float(df["finalPrice"].mean()), 2),
             "conversion_estimate": round(total_carts / (total_views + 1e-9) * 100, 2),
         }
 
-    # ─── 6. Product Stats ─────────────────────────────────────────────
+    # ─── 7. Product Stats ─────────────────────────────────────────────────────
     def get_product_stats(self):
         df = self.df
         return {
-            "total_products": len(df),
-            "total_categories": int(df["category_name"].nunique()),
-            "total_brands": int(df["brand_name"].nunique()),
+            "total_products":         len(df),
+            "total_categories":       int(df["category_name"].nunique()),
+            "total_brands":           int(df["brand_name"].nunique()),
             "price_range": {
                 "min": float(df["finalPrice"].min()),
                 "max": float(df["finalPrice"].max()),
                 "avg": round(float(df["finalPrice"].mean()), 2),
             },
-            "avg_rating": round(float(df["stats_averageRating"].mean()), 2),
-            "on_sale_count": int(df["isOnSale"].sum()),
-            "categories": df["category_name"].value_counts().to_dict(),
-            "top_brands": df["brand_name"].value_counts().head(10).to_dict(),
-            "avg_price_by_category": df.groupby("category_name")["finalPrice"].mean().round(2).to_dict(),
+            "avg_rating":             round(float(df["stats_averageRating"].mean()), 2),
+            "on_sale_count":          int(df["isOnSale"].sum()),
+            "categories":             df["category_name"].value_counts().to_dict(),
+            "top_brands":             df["brand_name"].value_counts().head(10).to_dict(),
+            "avg_price_by_category":  df.groupby("category_name")["finalPrice"].mean().round(2).to_dict(),
             "avg_rating_by_category": df.groupby("category_name")["stats_averageRating"].mean().round(2).to_dict(),
         }
 
-    # ─── 7. Helpers ───────────────────────────────────────────────────
+    # ─── 8. Helpers ───────────────────────────────────────────────────────────
     def get_categories(self):
         return sorted(self.df["category_name"].unique().tolist())
 
@@ -322,5 +366,6 @@ class RecommendationEngine:
         return sorted(self.df["brand_name"].unique().tolist())
 
     def get_brands_by_category(self, category):
-        df = self.df[self.df["category_name"] == category]
-        return sorted(df["brand_name"].unique().tolist())
+        return sorted(
+            self.df[self.df["category_name"] == category.lower().strip()]["brand_name"].unique().tolist()
+        )
